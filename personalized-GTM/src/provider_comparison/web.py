@@ -372,6 +372,7 @@ class Handler(BaseHTTPRequestHandler):
     workspace: Workspace
     public_origin: str | None = None
     demo_password: str | None = None
+    trusted_origins: tuple[str, ...] = ()
 
     def log_message(self, *_):
         pass
@@ -400,6 +401,10 @@ class Handler(BaseHTTPRequestHandler):
                    f"localhost:{self.server.server_port}": f"http://localhost:{self.server.server_port}"}
         if self.public_origin:
             allowed[urlparse(self.public_origin).netloc] = self.public_origin
+        for origin_url in self.trusted_origins:
+            parsed = urlparse(origin_url)
+            if parsed.scheme == "https" and parsed.netloc:
+                allowed[parsed.netloc] = origin_url
         origin = self.headers.get("Origin")
         return host in allowed and (not origin or origin == allowed[host])
 
@@ -482,34 +487,74 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(404, {"error": str(exc)})
 
 
+def _https_origin(url: str | None) -> str | None:
+    if not url:
+        return None
+    origin = urlparse(url)
+    if (origin.scheme != "https" or not origin.hostname or origin.username or origin.password
+            or origin.path not in ("", "/") or origin.query or origin.fragment):
+        return None
+    return f"https://{origin.netloc}"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run the local outreach workspace")
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8765")))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--data-dir", type=Path, default=ROOT / "comparison/artifacts/workspace")
-    parser.add_argument("--public-origin", default=os.environ.get("PUBLIC_ORIGIN") or os.environ.get("RENDER_EXTERNAL_URL"),
-                        help="Exact public HTTPS URL; requires DEMO_PASSWORD in the environment")
+    parser.add_argument("--public-origin", default=None,
+                        help="Exact public HTTPS URL; with DEMO_PASSWORD enables HTTP Basic auth")
     args = parser.parse_args()
     load_project_env()
+    demo_password = (os.environ.get("DEMO_PASSWORD") or "").strip()
+    explicit_public = _https_origin(os.environ.get("PUBLIC_ORIGIN"))
+    render_public = _https_origin(os.environ.get("RENDER_EXTERNAL_URL"))
+    cli_public = _https_origin(args.public_origin)
+
+    if os.environ.get("PUBLIC_ORIGIN") and not explicit_public:
+        parser.error("PUBLIC_ORIGIN must be an HTTPS origin, such as https://demo.example.com")
+    if args.public_origin and not cli_public:
+        parser.error("--public-origin must be an HTTPS origin, such as https://demo.example.com")
+
+    public_origin = cli_public or explicit_public
+    Handler.public_origin = None
+    Handler.demo_password = None
+    Handler.trusted_origins = ()
+
+    if explicit_public and len(demo_password) < 16:
+        parser.error(
+            "PUBLIC_ORIGIN is set but DEMO_PASSWORD must be at least 16 characters. "
+            "Add DEMO_PASSWORD in Render → Environment (or remove PUBLIC_ORIGIN)."
+        )
+    if public_origin and len(demo_password) >= 16:
+        Handler.public_origin = public_origin
+        Handler.demo_password = demo_password
+    elif render_public:
+        # Render sets RENDER_EXTERNAL_URL on every web service. Trust that host so the
+        # service can start without auth; set DEMO_PASSWORD to require demo / password login.
+        Handler.trusted_origins = (render_public,)
+        if len(demo_password) >= 16:
+            Handler.public_origin = render_public
+            Handler.demo_password = demo_password
+
     # 0.0.0.0 is the usual container bind address; Host checks still limit access to
-    # localhost unless PUBLIC_ORIGIN is configured for a public demo.
-    if args.host not in ("localhost", "127.0.0.1", "::1", "0.0.0.0") and not args.public_origin:
-        parser.error("A non-loopback host requires --public-origin and DEMO_PASSWORD.")
-    if args.public_origin:
-        origin = urlparse(args.public_origin)
-        if (origin.scheme != "https" or not origin.hostname or origin.username or origin.password
-                or origin.path not in ("", "/") or origin.query or origin.fragment):
-            parser.error("--public-origin must be an HTTPS origin, such as https://demo.example.com")
-        Handler.public_origin = f"https://{origin.netloc}"
-        Handler.demo_password = os.environ.get("DEMO_PASSWORD")
-        if not Handler.demo_password or len(Handler.demo_password) < 16:
-            parser.error("Set DEMO_PASSWORD to at least 16 characters before enabling a public demo.")
+    # localhost unless a public/trusted origin is configured.
+    if args.host not in ("localhost", "127.0.0.1", "::1", "0.0.0.0") and not (
+            Handler.public_origin or Handler.trusted_origins):
+        parser.error("A non-loopback host requires a trusted public origin (and DEMO_PASSWORD for auth).")
     Handler.workspace = Workspace(args.data_dir)
     log_path = args.data_dir / "workspace.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s",
                         handlers=[logging.StreamHandler(), logging.FileHandler(log_path, encoding="utf-8")])
-    logging.getLogger(__name__).info("workspace started data_dir=%s", args.data_dir)
+    log = logging.getLogger(__name__)
+    log.info("workspace started data_dir=%s", args.data_dir)
+    if Handler.public_origin and Handler.demo_password:
+        log.info("public demo auth enabled origin=%s user=demo", Handler.public_origin)
+    elif Handler.trusted_origins and not Handler.public_origin:
+        log.warning(
+            "Render URL is open without HTTP Basic auth; set DEMO_PASSWORD (16+ chars) to require demo login."
+        )
     try:
         server = WorkspaceServer((args.host, args.port), Handler)
     except OSError as exc:

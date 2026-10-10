@@ -46,7 +46,7 @@ Add these environment variables in Render before deploying:
 
 - `PYTHON_VERSION`: `3.12.10`
 - `FIRECRAWL_API_KEY`, `EXA_API_KEY`, `GEMINI_API_KEY`: your existing API keys.
-- `DEMO_PASSWORD`: a random password of at least 16 characters. Share it with the evaluator alongside the link. The username is `demo`.
+- `DEMO_PASSWORD`: a random password of at least 16 characters. Share it with the evaluator alongside the link. The username is `demo`. **Required for password-protected demos** when using `PUBLIC_ORIGIN`. On Render, if this is missing, the app still starts and trusts your `*.onrender.com` URL but **does not** prompt for login until you add `DEMO_PASSWORD`.
 
 Enter secrets directly in Render's environment settings. Do not upload `.env` to
 GitHub. The server uses Render's `PORT` and `RENDER_EXTERNAL_URL` automatically;
